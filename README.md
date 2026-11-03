@@ -1,4 +1,4 @@
-# Express Twitter Endpoint
+# Tweet Fetcher API
 
 ## Overview
 
