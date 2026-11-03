@@ -1,293 +1,196 @@
 'use strict';
 
-/**
- * Regression tests for the round-3 review (REVIEW-3.md / FIXLOG-3.md):
- *  - username type contract (screen name, "@" handling, invalid rejection)
- *  - API response classification (HTTP errors vs 2xx errors-only bodies)
- *  - timeout covering the body read (must surface as ETIMEDOUT, not as an
- *    empty result), and timeouts not being retried
- *  - a total 429 retry-wait budget (retryBudgetMs)
- */
-
-const { test, before, after } = require('node:test');
+const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
-const { createApp } = require('../src/app');
-const { TwitterClient, TwitterApiError, normalizeUsername } = require('../src/twitterClient');
+const { TwitterClient, TwitterApiError, parseNextData, extractTimeline } = require('../src/twitterClient');
+const { legacyTweet, pageProps, feedHtml, htmlResponse, queuedFetch } = require('./helpers');
 
-function fakeRes({ status = 200, body = null, headers = {} } = {}) {
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    statusText: `status-${status}`,
-    headers: { get: (k) => (k.toLowerCase() in headers ? headers[k.toLowerCase()] : null) },
-    json: async () => body,
-  };
-}
-const noSleep = async () => {};
-
-// ---------- username type contract (P0-1) ----------
-
-test('normalizeUsername strips one leading @ and keeps valid screen names', () => {
-  assert.equal(normalizeUsername('elonmusk'), 'elonmusk');
-  assert.equal(normalizeUsername('@elonmusk'), 'elonmusk');
-  assert.equal(normalizeUsername('NASA'), 'NASA');
-});
-
-test('normalizeUsername rejects IDs with invalid characters and non-strings before any HTTP call', () => {
-  for (const bad of ['bad-name', 'has space', '@@double', 'way_too_long_name1', '', 44196397, null]) {
-    assert.throws(
-      () => normalizeUsername(bad),
-      (e) => e instanceof TwitterApiError && e.code === 'EINVALIDUSERNAME',
-      `expected EINVALIDUSERNAME for ${String(bad)}`
-    );
-  }
-});
-
-test('getUserByUsername("@elonmusk") requests the clean screen-name URL (no %40)', async () => {
-  const urls = [];
+test('a page without __NEXT_DATA__ is an upstream error, never an empty result', async () => {
   const client = new TwitterClient({
-    bearerToken: 't',
-    fetchImpl: async (url) => {
-      urls.push(url);
-      return fakeRes({ body: { data: { id: '1', username: 'elonmusk', name: 'E' } } });
-    },
-    sleepImpl: noSleep,
+    fetchImpl: queuedFetch([htmlResponse('<html><body>something else</body></html>')]),
   });
-  const user = await client.getUserByUsername('@elonmusk');
-  assert.equal(user.id, '1');
-  assert.equal(urls.length, 1);
-  assert.ok(urls[0].includes('/users/by/username/elonmusk?'), urls[0]);
-  assert.ok(!urls[0].includes('%40'), urls[0]);
+  await assert.rejects(client.getLatestPost('nasa'), (err) => {
+    assert.ok(err instanceof TwitterApiError);
+    assert.equal(err.status, 502);
+    assert.equal(err.code, 'upstream_malformed');
+    return true;
+  });
 });
 
-test('getUserByUsername rejects an invalid username without calling fetch', async () => {
-  let calls = 0;
+test('a page whose __NEXT_DATA__ is not valid JSON is an upstream error', async () => {
+  const html =
+    '<script id="__NEXT_DATA__" type="application/json">{not json</script>';
+  const client = new TwitterClient({ fetchImpl: queuedFetch([htmlResponse(html)]) });
+  await assert.rejects(client.getLatestPost('nasa'), (err) => {
+    assert.equal(err.code, 'upstream_malformed');
+    return true;
+  });
+});
+
+test('empty timeline with no header = user_not_found (unknown/protected/suspended are indistinguishable)', async () => {
+  const html = feedHtml(pageProps({ tweets: [], withHeader: false, screenName: null }));
+  const client = new TwitterClient({ fetchImpl: queuedFetch([htmlResponse(html)]) });
+  await assert.rejects(client.getLatestPost('ghostuser'), (err) => {
+    assert.equal(err.status, 404);
+    assert.equal(err.code, 'user_not_found');
+    return true;
+  });
+});
+
+test('existing user with zero posts resolves the user and returns tweet = null', async () => {
+  const html = feedHtml(pageProps({ tweets: [], withHeader: true, screenName: 'quietuser' }));
+  const client = new TwitterClient({ fetchImpl: queuedFetch([htmlResponse(html)]) });
+  const { user, tweet } = await client.getLatestPost('quietuser');
+  assert.equal(tweet, null);
+  assert.equal(user.username, 'quietuser');
+});
+
+test('entries without a usable tweet are skipped instead of failing the parse', async () => {
+  const props = pageProps({ tweets: [legacyTweet({ id: '5001' })] });
+  props.timeline.entries.unshift({ type: 'tweet', entry_id: 'x', content: {} });
+  props.timeline.entries.push(null);
+  props.timeline.entries.push({ type: 'cursor', entry_id: 'c', content: {} });
   const client = new TwitterClient({
-    bearerToken: 't',
-    fetchImpl: async () => { calls += 1; return fakeRes({}); },
-    sleepImpl: noSleep,
+    fetchImpl: queuedFetch([htmlResponse(feedHtml(props))]),
   });
-  await assert.rejects(
-    client.getUserByUsername('bad-name'),
-    (e) => e instanceof TwitterApiError && e.code === 'EINVALIDUSERNAME'
-  );
-  assert.equal(calls, 0);
+  const { tweet } = await client.getLatestPost('nasa');
+  assert.equal(tweet.id, '5001');
 });
 
-test('"@ELONMUSK" and "elonmusk" share the same cache entry', async () => {
-  let calls = 0;
+test('full_text is preferred; text is the fallback; missing dates disqualify a tweet', async () => {
+  const noFullText = legacyTweet({ id: '5002', createdAt: 'Mon Nov 02 12:00:00 +0000 2026' });
+  delete noFullText.full_text;
+  noFullText.text = 'fallback text';
+  const badDate = legacyTweet({ id: '5003', createdAt: 'not a date' });
+  const { tweet } = await new TwitterClient({
+    fetchImpl: queuedFetch([htmlResponse(feedHtml(pageProps({ tweets: [badDate, noFullText] })))]),
+  }).getLatestPost('nasa');
+  assert.equal(tweet.id, '5002');
+  assert.equal(tweet.text, 'fallback text');
+});
+
+test('parseNextData / extractTimeline units: garbage in, malformed out', () => {
+  assert.equal(parseNextData('no script here'), null);
+  assert.equal(parseNextData(42), null);
+  assert.equal(extractTimeline(null).malformed, true);
+  assert.equal(extractTimeline({ props: {} }).malformed, true);
+  assert.deepEqual(extractTimeline(null).tweets, []);
+});
+
+test('the __NEXT_DATA__ tag is found regardless of attribute order or extra attributes', async () => {
+  const props = pageProps({ tweets: [legacyTweet({ id: '6001' })] });
+  const data = JSON.stringify({ props: { pageProps: props }, page: '/', query: {} });
+  const html =
+    `<html><body><script type="application/json" data-x="1" id="__NEXT_DATA__">${data}</script></body></html>`;
+  const client = new TwitterClient({ fetchImpl: queuedFetch([htmlResponse(html)]) });
+  const { tweet } = await client.getLatestPost('nasa');
+  assert.equal(tweet.id, '6001');
+});
+
+test('a well-formed JSON whose pageProps is empty is malformed (502), not user_not_found', async () => {
+  const html =
+    '<script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{}}}</script>';
+  const client = new TwitterClient({ fetchImpl: queuedFetch([htmlResponse(html)]) });
+  await assert.rejects(client.getLatestPost('nasa'), (err) => {
+    assert.equal(err.status, 502);
+    assert.equal(err.code, 'upstream_malformed');
+    return true;
+  });
+});
+
+test('entries that is not an array is malformed (502)', async () => {
+  const html =
+    '<script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"timeline":{"entries":{}}}}}</script>';
+  const client = new TwitterClient({ fetchImpl: queuedFetch([htmlResponse(html)]) });
+  await assert.rejects(client.getLatestPost('nasa'), (err) => err.status === 502);
+});
+
+test('headerProps present but null is malformed (502), not absent', async () => {
+  const props = pageProps({ tweets: [], withHeader: false });
+  props.headerProps = null;
+  const client = new TwitterClient({ fetchImpl: queuedFetch([htmlResponse(feedHtml(props))]) });
+  await assert.rejects(client.getLatestPost('nasa'), (err) => {
+    assert.equal(err.status, 502);
+    assert.equal(err.code, 'upstream_malformed');
+    return true;
+  });
+});
+
+test('a data-id attribute is not mistaken for the __NEXT_DATA__ id', async () => {
+  const props = pageProps({ tweets: [legacyTweet({ id: '6020' })] });
+  const realData = JSON.stringify({ props: { pageProps: props }, page: '/', query: {} });
+  const html =
+    '<html><body>' +
+    '<script data-id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{}}}</script>' +
+    `<script id="__NEXT_DATA__" type="application/json">${realData}</script>` +
+    '</body></html>';
+  const client = new TwitterClient({ fetchImpl: queuedFetch([htmlResponse(html)]) });
+  const { tweet } = await client.getLatestPost('nasa');
+  assert.equal(tweet.id, '6020');
+});
+
+test('a header object without a screenName is malformed (502), even with an empty timeline', async () => {
+  const props = pageProps({ tweets: [], withHeader: false });
+  props.headerProps = { followersCount: 3 }; // header exists, screenName missing
+  const client = new TwitterClient({ fetchImpl: queuedFetch([htmlResponse(feedHtml(props))]) });
+  await assert.rejects(client.getLatestPost('nasa'), (err) => {
+    assert.equal(err.status, 502);
+    assert.equal(err.code, 'upstream_malformed');
+    return true;
+  });
+});
+
+test('a header object without a screenName is malformed (502) when posts exist too', async () => {
+  const props = pageProps({ tweets: [legacyTweet({ id: '6010' })], withHeader: false });
+  props.headerProps = {};
+  const client = new TwitterClient({ fetchImpl: queuedFetch([htmlResponse(feedHtml(props))]) });
+  await assert.rejects(client.getLatestPost('nasa'), (err) => err.status === 502);
+});
+
+test('posts on a page with NO profile header at all are malformed (502), not a result', async () => {
+  const props = pageProps({ tweets: [legacyTweet({ id: '6011' })], withHeader: false });
+  const client = new TwitterClient({ fetchImpl: queuedFetch([htmlResponse(feedHtml(props))]) });
+  await assert.rejects(client.getLatestPost('nasa'), (err) => {
+    assert.equal(err.status, 502);
+    assert.equal(err.code, 'upstream_malformed');
+    return true;
+  });
+});
+
+test('entries exist but none carries a usable tweet -> malformed (502), not user_not_found', async () => {
+  const props = pageProps({ tweets: [], withHeader: false, screenName: null });
+  props.timeline.entries = [
+    { type: 'tweet', entry_id: 'a', content: { tweet: { nope: true } } },
+    { type: 'tweet', entry_id: 'b', content: { tweet: { id_str: '1' } } },
+  ];
   const client = new TwitterClient({
-    bearerToken: 't',
-    fetchImpl: async () => {
-      calls += 1;
-      return fakeRes({ body: { data: { id: '1', username: 'elonmusk', name: 'E' } } });
-    },
-    sleepImpl: noSleep,
+    fetchImpl: queuedFetch([htmlResponse(feedHtml(props))]),
   });
-  await client.getUserByUsername('elonmusk');
-  await client.getUserByUsername('@ELONMUSK');
-  assert.equal(calls, 1);
+  await assert.rejects(client.getLatestPost('nasa'), (err) => {
+    assert.equal(err.status, 502);
+    assert.equal(err.code, 'upstream_malformed');
+    return true;
+  });
 });
 
-// ---------- API response classification (P0-2) ----------
-
-test('HTTP error statuses with error bodies throw TwitterApiError carrying that status', async () => {
-  for (const status of [401, 403, 404, 500]) {
-    let calls = 0;
-    const client = new TwitterClient({
-      bearerToken: 't',
-      fetchImpl: async () => {
-        calls += 1;
-        return fakeRes({ status, body: { errors: [{ message: 'boom', detail: 'boom' }], title: 'Error' } });
-      },
-      sleepImpl: noSleep,
-    });
-    await assert.rejects(
-      client.getLatestTweet('123'),
-      (e) => e instanceof TwitterApiError && e.status === status,
-      `status ${status} must surface as-is`
-    );
-    assert.equal(calls, 1, `status ${status} must not be retried or swallowed`);
-  }
-});
-
-test('a 2xx body with errors and no data is an upstream error, not an empty result', async () => {
+test('an upstream HTTP 500 surfaces its status as an upstream error', async () => {
   const client = new TwitterClient({
-    bearerToken: 't',
-    fetchImpl: async () =>
-      fakeRes({ body: { errors: [{ message: 'User has been suspended.', detail: 'suspended' }] } }),
-    sleepImpl: noSleep,
+    fetchImpl: queuedFetch([htmlResponse('oops', { status: 500 })]),
   });
-  await assert.rejects(
-    client.getLatestTweet('123'),
-    (e) => e instanceof TwitterApiError && e.code === 'EUPSTREAMERRORS'
-  );
-  await assert.rejects(
-    client.getUserByUsername('someone'),
-    (e) => e instanceof TwitterApiError && e.code === 'EUPSTREAMERRORS' && e.status !== 404
-  );
+  await assert.rejects(client.getLatestPost('nasa'), (err) => {
+    assert.equal(err.status, 500);
+    assert.equal(err.code, 'upstream_http');
+    return true;
+  });
 });
 
-test('a 2xx body with BOTH data and errors (partial success) is still used', async () => {
+test('an upstream HTTP 404 surfaces as user_not_found', async () => {
   const client = new TwitterClient({
-    bearerToken: 't',
-    fetchImpl: async () =>
-      fakeRes({
-        body: {
-          data: [{ id: '10', text: 'hello', created_at: '2026-11-03T00:00:00.000Z' }],
-          errors: [{ message: 'a referenced resource was missing' }],
-        },
-      }),
-    sleepImpl: noSleep,
+    fetchImpl: queuedFetch([htmlResponse('nope', { status: 404 })]),
   });
-  const tweet = await client.getLatestTweet('123');
-  assert.equal(tweet.id, '10');
-});
-
-// ---------- app-level classification ----------
-
-let server;
-let baseUrl;
-
-before(async () => {
-  const client = new TwitterClient({
-    bearerToken: 't',
-    fetchImpl: async (url) => {
-      if (url.includes('/users/by/username/')) {
-        // X answers 200 with an errors-only body for e.g. suspended accounts.
-        return fakeRes({ body: { errors: [{ message: 'User has been suspended.', detail: 'suspended' }] } });
-      }
-      throw new Error(`Unexpected URL in mock: ${url}`);
-    },
-    sleepImpl: noSleep,
+  await assert.rejects(client.getLatestPost('nasa'), (err) => {
+    assert.equal(err.status, 404);
+    assert.equal(err.code, 'user_not_found');
+    return true;
   });
-  const app = createApp({ client, username: 'elonmusk', cacheTtlMs: 0 });
-  await new Promise((resolve) => {
-    server = app.listen(0, () => {
-      baseUrl = `http://127.0.0.1:${server.address().port}`;
-      resolve();
-    });
-  });
-});
-
-after(async () => {
-  await new Promise((resolve) => server.close(resolve));
-});
-
-test('app maps a 2xx errors-only upstream body to 502 upstream_error (not 404)', async () => {
-  const res = await fetch(`${baseUrl}/latest-tweet?username=suspendeduser`);
-  assert.equal(res.status, 502);
-  const body = await res.json();
-  assert.equal(body.error, 'upstream_error');
-});
-
-// ---------- timeout semantics (P1: body read) ----------
-
-test('a timeout during the body read surfaces as ETIMEDOUT, not as an empty result', async () => {
-  const client = new TwitterClient({
-    bearerToken: 't',
-    timeoutMs: 60,
-    maxRetries: 3,
-    fetchImpl: async (url, opts) => ({
-      ok: true,
-      status: 200,
-      statusText: 'OK',
-      headers: { get: () => null },
-      json: () =>
-        new Promise((_, reject) => {
-          opts.signal.addEventListener('abort', () => {
-            const e = new Error('The operation was aborted');
-            e.name = 'AbortError';
-            reject(e);
-          });
-        }),
-    }),
-    sleepImpl: noSleep,
-  });
-  await assert.rejects(
-    client.getLatestTweet('1'),
-    (e) => e instanceof TwitterApiError && e.code === 'ETIMEDOUT'
-  );
-});
-
-test('timeouts are not retried (only HTTP 429 is)', async () => {
-  let calls = 0;
-  const client = new TwitterClient({
-    bearerToken: 't',
-    timeoutMs: 60,
-    maxRetries: 3,
-    fetchImpl: (url, opts) => {
-      calls += 1;
-      return new Promise((_, reject) => {
-        opts.signal.addEventListener('abort', () => {
-          const e = new Error('The operation was aborted');
-          e.name = 'AbortError';
-          reject(e);
-        });
-      });
-    },
-    sleepImpl: noSleep,
-  });
-  await assert.rejects(client.getLatestTweet('1'), (e) => e.code === 'ETIMEDOUT');
-  assert.equal(calls, 1);
-});
-
-// ---------- 429 total wait budget (P1) ----------
-
-test('the default retry budget is 90000 ms', () => {
-  const client = new TwitterClient({ bearerToken: 't', fetchImpl: async () => fakeRes({}) });
-  assert.equal(client.retryBudgetMs, 90_000);
-});
-
-test('retrying stops when the next wait would exceed the total budget', async () => {
-  const waits = [];
-  let calls = 0;
-  const client = new TwitterClient({
-    bearerToken: 't',
-    maxRetries: 10,
-    retryMaxDelayMs: 30_000,
-    retryBudgetMs: 45_000,
-    fetchImpl: async () => {
-      calls += 1;
-      return fakeRes({ status: 429, body: { title: 'Too Many Requests' }, headers: { 'retry-after': '3600' } });
-    },
-    sleepImpl: async (ms) => { waits.push(ms); },
-  });
-  await assert.rejects(
-    client.getLatestTweet('1'),
-    (e) => e instanceof TwitterApiError && e.status === 429
-  );
-  // First wait (30 s) fits the 45 s budget; the second (another 30 s) does not.
-  assert.deepEqual(waits, [30_000]);
-  assert.equal(calls, 2);
-});
-
-test('within the budget, retries proceed up to maxRetries as before', async () => {
-  const waits = [];
-  let calls = 0;
-  const client = new TwitterClient({
-    bearerToken: 't',
-    maxRetries: 2,
-    retryBaseDelayMs: 100,
-    retryMaxDelayMs: 30_000,
-    retryBudgetMs: 90_000,
-    fetchImpl: async () => {
-      calls += 1;
-      return fakeRes({ status: 429, body: { title: 'Too Many Requests' } });
-    },
-    sleepImpl: async (ms) => { waits.push(ms); },
-  });
-  await assert.rejects(client.getLatestTweet('1'), (e) => e.status === 429);
-  assert.equal(calls, 3);
-  assert.deepEqual(waits, [100, 200]);
-});
-
-// ---------- README guards ----------
-
-test('README documents the retry budget setting and the username contract', () => {
-  const readme = fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8');
-  assert.ok(readme.includes('TWITTER_RETRY_BUDGET_MS'), 'README must document TWITTER_RETRY_BUDGET_MS');
-  assert.ok(/screen name/i.test(readme), 'README must state the username is a screen name');
 });

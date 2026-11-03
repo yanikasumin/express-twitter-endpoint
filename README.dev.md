@@ -1,10 +1,32 @@
-# express-twitter-endpoint
+# express-twitter-endpoint — developer notes
 
-A single-endpoint Express.js service that returns the **latest tweet of a given
-X (Twitter) user** — text, timestamp and link — as JSON, using the
-**X API v2**.
+A single-endpoint Express.js service that returns the **latest tweet of a
+given X (Twitter) user** — text, timestamp and link — as JSON.
+
+**Data source (no-key version):** the public syndication feed behind X's
+embed widgets, `https://syndication.twitter.com/srv/timeline-profile/screen-name/<name>`.
+No X API key, developer account or login is used anywhere. An earlier
+revision of this repository used the official X API v2 with a Bearer
+Token; see the git history for it.
 
 Default target user: **Elon Musk (`@elonmusk`)** (configurable).
+
+---
+
+## Architecture
+
+The code is layered so each part can be reused or replaced on its own:
+
+| File | Role |
+|---|---|
+| `src/twitterClient.js` | Data layer. Fetches the feed page, extracts the embedded `__NEXT_DATA__` JSON, normalises legacy-format tweets, applies the filters and the retry/deadline policy. No Express dependency. |
+| `src/app.js` | HTTP layer. `createLatestTweetHandler` (one route handler) and `createApp` (handler + /health + optional key gate + JSON 404). No port binding, no env access. |
+| `src/index.js` | Library entry (`package.json` `main`). Re-exports both layers. Importing it has no side effects. |
+| `src/server.js` | Standalone entry. Reads `.env`, builds the client and app, listens. This is the only file that touches the environment or a port. |
+
+Embedding levels (also shown in README.md): client only → handler on a
+host router → `createApp` mounted as a sub-application → standalone
+server.
 
 ---
 
@@ -52,240 +74,139 @@ Returns the user's most recent tweet.
 curl "http://localhost:3000/latest-tweet?username=nasa&exclude_replies=include"
 ```
 
-**The `username` is a screen name, not a numeric user ID.** It is resolved
-through `GET /2/users/by/username/:username`; a single leading `@` is
-accepted and stripped. Numeric IDs are only used internally, as the input
-of the timeline request, after the resolution.
+**The `username` is a screen name, not a numeric user ID.** A single
+leading `@` is accepted and stripped. The numeric author `id` in the
+response comes from the feed payload itself; no separate user-lookup
+call exists in this version.
 
 **How the "latest" tweet is selected (exactly what the implementation
-does):** one timeline request with `max_results=5`, with the retweet/reply
-exclusions applied by the X API itself. From the returned entries, entries
-with a malformed shape (missing string `id`/`text`/`created_at`) are skipped and the
-first remaining entry is returned. There is **no pagination** and no
-fetching of the user's full timeline: if all (up to) 5 returned entries
-are filtered out or malformed, the answer is `404 no_tweets_found` even
-though older tweets may exist.
+does):** among the tweets embedded in the feed page, drop retweets
+(payload carries `retweeted_status`, or the text starts with `RT @`)
+when retweets are excluded, and drop replies (payload carries
+`in_reply_to_status_id_str`) when replies are excluded; then take the
+maximum by `created_at`. Feed order is never trusted (a pinned tweet
+is listed first but is usually old). The feed only embeds a bounded
+window of recent posts, so selection is limited to that window.
 
 ### `GET /health`
 
-```json
-{ "status": "ok" }
-```
+Returns `{ "status": "ok" }`. Process liveness only — it says nothing
+about upstream reachability.
 
-**Error responses**
+**Errors**
 
-| HTTP | `error`              | When                                                                 |
-| ---- | -------------------- | -------------------------------------------------------------------- |
-| 400  | `invalid_username`   | The `username` parameter is not a valid X username (1-15 chars: letters, digits, underscores) — including non-string values such as a repeated parameter (`?username=a&username=b`) |
-| 401  | `unauthorized`       | `APP_API_KEY` is set on the server and the request's `x-api-key` header is missing or wrong (only when the key gate is enabled) |
-| 404  | `user_not_found`     | The username does not exist on X                                     |
-| 404  | `no_tweets_found`    | The user exists but has no tweets matching the current filters       |
-| 502  | `upstream_auth_error`| The Bearer Token was rejected (401/403 from X: invalid token or the app's access level does not cover these endpoints) |
-| 502  | `upstream_error`     | Any other X API failure (details are written to the server log only)  |
-| 503  | `rate_limited`       | X API rate limit reached even after retries — wait and retry (a `Retry-After` header is included when X provided one) |
-| 500  | `internal_error`     | Unexpected server error                                              |
+| Status | `error`           | When |
+| ------ | ----------------- | ---- |
+| 400    | `invalid_username`| Username missing-shaped, over-long, or not a string |
+| 401    | `unauthorized`    | `APP_API_KEY` set and the `x-api-key` header does not match |
+| 404    | `user_not_found`  | The feed shows no such user (no profile header, empty timeline). Protected accounts keep their header and surface as `no_tweets_found`; suspended accounts were not measured |
+| 404    | `no_tweets_found` | The user exists but no returned post matches the filters |
+| 404    | `not_found`       | Unknown route (createApp only) |
+| 502    | `upstream_error`  | Feed unreachable, malformed, or answered an error status |
+| 503    | `rate_limited`    | Feed rate limit persisted through the retries (`Retry-After` header attached when the wait is known) |
+| 500    | `internal_error`  | Anything unexpected |
 
-Error body shape: `{ "error": "<code>", "message": "<human-readable detail>" }`
-
----
-
-## Setup
-
-**Requirements:** Node.js **>= 20.6.0**. The start scripts use Node's built-in
-`--env-file` flag, which was only added in **Node 20.6.0** — on Node 20.0–20.5
-`npm start` fails with "bad option: --env-file". The built-in test runner is
-used for the tests — no extra tooling needed.
-
-> ⚠️ **Plan requirement — paid X API access is required.** The endpoints used
-> by this service are not available for free. As of November 2026 the X API
-> is billed **pay-per-use** (there are no subscription tiers for new
-> developers): you prepay credits in the X Developer Console, and each read
-> is charged per resource returned — US$0.010 per user lookup and US$0.005
-> per post read for the endpoints used here. (The former Basic subscription
-> tier — US$100/month when it was introduced in 2023 — was retired in 2026,
-> so there is no "Basic plan" to buy anymore.) See "Getting an X API Bearer
-> Token" below before you start, and check the official pricing page for
-> the current rates — X API pricing changes over time.
-
-```bash
-npm install
-cp .env.example .env   # then edit .env and set your Bearer Token
-npm start
-```
-
-The server listens on `http://localhost:3000` by default.
-
-**Development mode** (auto-restart on file changes):
-
-```bash
-npm run dev
-```
-
-**Tests** (fully offline — the X API is mocked, no token needed):
-
-```bash
-npm test
-```
+Upstream error details are written to the server log (with a
+per-request id) and never included in responses.
 
 ---
 
-## Configuration (`.env`)
+## The feed payload, as observed (2026-11-03)
 
-| Variable             | Default    | Description                                                                 |
-| -------------------- | ---------- | --------------------------------------------------------------------------- |
-| `TWITTER_BEARER_TOKEN` | *(required)* | Bearer Token of your X Developer App                                      |
-| `TWITTER_USERNAME`   | `elonmusk` | Default user whose latest tweet is returned — a screen name (a leading `@` is accepted and stripped; not a numeric user ID) |
-| `EXCLUDE_RETWEETS`   | `exclude`  | `exclude` or `include` — default handling of retweets                        |
-| `EXCLUDE_REPLIES`    | `exclude`  | `exclude` or `include` — default handling of replies                         |
-| `CACHE_TTL_SECONDS`  | `60`       | In-memory cache TTL for responses (rate-limit protection)                    |
-| `TWITTER_TIMEOUT_MS` | `10000`    | Per-request timeout for X API calls (ms; covers reading the response body)   |
-| `TWITTER_MAX_RETRIES`| `3`        | Retries on HTTP 429 with exponential backoff (honours `Retry-After` up to the configured cap) |
-| `TWITTER_RETRY_BUDGET_MS` | `90000` | Cap on the TOTAL time spent waiting between 429 retries of one call; retrying stops early once the next wait would exceed it |
-| `TWITTER_DEADLINE_MS` | `60000`   | Overall deadline for handling one `/latest-tweet` request: the username lookup and the timeline fetch share a single deadline, and every attempt plus every retry wait of both calls must fit inside it; an attempt is cut off at the deadline (`0` disables it, not recommended) |
-| `APP_API_KEY`        | *(unset)*  | Optional shared secret. When set, `/latest-tweet` requires this value in the `x-api-key` header (401 otherwise). Unset = no authentication (local / trusted networks only) |
-| `PORT`               | `3000`     | Listening port                                                               |
+- `GET /srv/timeline-profile/screen-name/<name>` answers `200` with an
+  HTML page containing `<script id="__NEXT_DATA__" type="application/json">`.
+- Tweets live at `props.pageProps.timeline.entries[]`, each
+  `{ type: "tweet", content: { tweet: {…} } }` in legacy format:
+  `id_str`, `full_text` (fallback `text`), `created_at`
+  (`"Mon Nov 02 22:30:01 +0000 2026"`), `user { id_str, screen_name, name }`,
+  optional `retweeted_status`, optional `in_reply_to_status_id_str`.
+- `props.pageProps.headerProps.screenName` names the profile. For an
+  unknown account the page still answers 200 but has **no**
+  `headerProps` and **zero** entries — that absence is the
+  user_not_found signal. A protected account (measured 2026-11-03)
+  keeps its `headerProps` with the screen name and has zero entries,
+  so it resolves as an existing user with no visible posts
+  (`no_tweets_found`). Suspended accounts were not measured.
+- Entry count varies (20–100 observed). The legacy JSON endpoint
+  (`cdn.syndication.twimg.com/timeline/profile`) is dead (200, empty
+  body) and is not used.
+- Rate limiting: `429` with a plain-text body, headers
+  `x-rate-limit-limit: 30`, `x-rate-limit-remaining`,
+  `x-rate-limit-reset` (epoch seconds; a 15-minute window was
+  observed). No `Retry-After` header was present, so the client reads
+  the reset header first-class and also supports `Retry-After`.
 
-> ⚠️ Never commit your real `.env` to version control. `.env` is already listed
-> in `.gitignore`.
+## Reliability behaviour
 
----
+- **Cache**: successful payloads are cached per
+  `username|retweets|replies` key (username lower-cased — X screen
+  names are case-insensitive) for `CACHE_TTL_SECONDS` (default 60 s).
+  Each handler instance owns its cache, bounded at 500 entries with
+  oldest-first eviction.
+- **Retries**: HTTP 429 and transport failures are retried up to
+  `UPSTREAM_MAX_RETRIES` (default 3). The wait before a 429 retry is
+  the upstream suggestion (`Retry-After`, else the reset time, else
+  exponential backoff). A suggested wait longer than the per-wait cap
+  of **30 s** is NOT shortened and retried early — the operation
+  fails fast as 503 + `Retry-After` carrying the full suggested wait.
+  Total waiting is capped by `UPSTREAM_RETRY_BUDGET_MS` (default 90 s).
+- **Deadline**: one deadline (`REQUEST_DEADLINE_MS`, default 60 s)
+  bounds the whole operation: attempts are aborted at the deadline
+  (AbortController, timeout shrunk to the remaining time), a wait that
+  would cross it is not taken, and no attempt starts after it. One
+  attempt = fetch + full body read under the same timer, so a body
+  that stalls after the headers is aborted too, and a body-read
+  failure is classified `upstream_timeout` / `upstream_network`
+  (→ 502), never leaked as a bare exception.
+- **Structure validation**: the payload must have a `props.pageProps`
+  object with a `timeline.entries` array. Missing pieces, entries
+  that carry no tweet objects, entries whose posts all fail to
+  normalise, posts that are all by someone other than the profile
+  owner, a header object without a screen name, or posts on a page
+  with no profile header at all are `upstream_malformed` (→ 502).
+  Only the measured signature (no header object, empty entries
+  array) is `user_not_found`; a profile header with a well-formed
+  empty timeline is `no_tweets_found`. Selection only ever picks the
+  profile owner's own posts. A page whose `__NEXT_DATA__` JSON does
+  not parse is also `upstream_malformed`: at this layer a truncated
+  download and a changed page structure are indistinguishable, and
+  both surface as 502 either way.
+- **Host responsibilities**: this component deliberately does NOT
+  coalesce concurrent requests for the same user, negative-cache
+  404/503 answers, or rate-limit per caller. When exposing it
+  publicly, the host (or its reverse proxy) owns those: request
+  coalescing / queuing per screen name, short negative caching
+  (e.g. 404 for a minute, 503 for the `Retry-After` duration), and
+  per-caller (IP / API key) rate limits. A custom `fetchImpl` must
+  honour the `AbortSignal` it receives, like standard fetch — the
+  timeout and deadline control relies on it.
+- **Validation**: usernames are type-checked before use (array/object
+  query values are a 400, not a crash); the optional API key is
+  compared in constant time.
 
-## Getting an X API Bearer Token
+## Configuration
 
-1. Sign up / sign in at the **X Developer Portal**: https://developer.x.com
-2. Create a **Project** and an **App** inside it.
-3. Open the App's **"Keys and tokens"** page and copy the **Bearer Token**.
-4. Paste it into `.env` as `TWITTER_BEARER_TOKEN=...`.
+Standalone mode is configured by `.env` (see `.env.example`):
+`TWITTER_USERNAME`, `EXCLUDE_RETWEETS`, `EXCLUDE_REPLIES`,
+`CACHE_TTL_SECONDS`, `UPSTREAM_TIMEOUT_MS`, `UPSTREAM_MAX_RETRIES`,
+`UPSTREAM_RETRY_BUDGET_MS`, `REQUEST_DEADLINE_MS`, `APP_API_KEY`,
+`PORT`, `HOST` (standalone bind interface, default `127.0.0.1`).
+In library use the same knobs are constructor / factory
+options; nothing is read from the environment.
 
-**Access level / permissions required**
+## Tests
 
-- The endpoints used are read-only:
-  - `GET /2/users/by/username/:username` (username → user ID resolution)
-  - `GET /2/users/:id/tweets` (user timeline)
-- App-only authentication (Bearer Token) is sufficient; **no user login /
-  OAuth flow is needed**, and no write permissions are used.
-- These endpoints require **paid X API access**. As of November 2026 there
-  is no free tier for new developers and no subscription tier to choose:
-  billing is pay-per-use against a prepaid credit balance, and calls made
-  without credit are rejected (this service maps authorization failures to
-  `502 upstream_auth_error`). Under the former subscription model, this
-  access level corresponded to the Basic tier or higher. Only **public**
-  accounts can be read this way. Plan terms, prices and rate limits change
-  over time — check the X Developer Portal (docs.x.com) for the current
-  pricing and limits before deploying.
+`npm test` (Node's built-in runner) runs fully offline:
 
-## Rate limits
-
-The X API rate-limits timeline reads (per app / per user, on a rolling
-15-minute window; exact numbers depend on the endpoint). To stay well within the
-limits, this service:
-
-- caches successful responses in memory for `CACHE_TTL_SECONDS` (default 60s),
-  keyed by username + filter settings,
-- caches the username → ID resolution for the lifetime of the process,
-- retries an upstream `429` up to `TWITTER_MAX_RETRIES` times (default 3) with
-  exponential backoff, honouring the API's `Retry-After` header when present,
-  up to the configured per-wait cap;
-  each single wait is capped at 30 s by default, and the total waiting time per call is
-  additionally capped by `TWITTER_RETRY_BUDGET_MS` (default 90 s), so a long
-  `Retry-After` cannot keep a request hanging indefinitely,
-- if the limit persists, maps the `429` to a clean `503 rate_limited` response
-  (propagating `Retry-After` to the caller when available) instead of
-  hammering the API,
-- times out any single X API request after `TWITTER_TIMEOUT_MS` (default 10s),
-- and bounds the whole handling of one incoming request by a single overall
-  deadline, `TWITTER_DEADLINE_MS` (default 60s), shared by the username
-  lookup and the timeline fetch and covering every attempt and every retry
-  wait of both calls: an in-flight attempt is cut off at the deadline and a
-  retry wait that would cross it is not taken, so a single incoming request
-  can never occupy the server for longer than that.
-
----
-
-## Running it publicly (access control & cost)
-
-Out of the box this service has **no caller authentication**, and every
-uncached `/latest-tweet` request spends real money on the X API (pay-per-use:
-a user lookup plus post reads). Do not expose it to the public internet
-as-is. For a public deployment, combine:
-
-- **Caller authentication** — set `APP_API_KEY` to a long random string;
-  `/latest-tweet` then requires that value in the `x-api-key` header and
-  answers `401 unauthorized` otherwise. (`/health` stays open for load
-  balancers.) This is a basic shared-secret gate, not a user system — put a
-  real gateway / reverse proxy in front for anything stronger.
-- **Rate limiting** — enforce per-caller request limits at your reverse
-  proxy or gateway (e.g. nginx `limit_req`). The built-in response cache
-  already collapses identical sequential requests within
-  `CACHE_TTL_SECONDS`, but it does not merge simultaneous in-flight
-  requests for the same user (each still costs its own upstream calls),
-  and it is not a rate limiter.
-- **Spending caps on the X side** — billing is pay-per-use against prepaid
-  credit in the X Developer Console. Keep only the credit you are willing
-  to spend there and review usage regularly. The prepaid balance works as
-  a hard cap only while nothing tops it up automatically: if an
-  auto-recharge (automatic top-up) option is enabled for the account in
-  the console, turn it off — with auto-recharge on, spending continues
-  past the initial balance and the balance by itself caps nothing. In
-  addition, set a **Spending limit** in the Developer Console: it caps
-  spend per billing cycle independently of the prepaid balance, so it
-  still bounds the damage if credit remains (or is topped up) when a
-  deployment misbehaves. Treat the two as separate caps and set both.
-
----
-
-## Project structure
-
-```
-express-twitter-endpoint/
-├── package.json
-├── .env.example          # template — copy to .env
-├── README.md
-├── src/
-│   ├── server.js         # entry point (env -> client -> app -> listen)
-│   ├── app.js            # Express app: /latest-tweet, /health, cache, error mapping
-│   └── twitterClient.js  # minimal X API v2 client (injectable fetch for testing)
-└── test/
-    ├── app.test.js         # integration tests (mocked X API, real HTTP)
-    ├── twitterClient.test.js # unit tests for the API client
-    ├── hardening.test.js   # retry/timeout/validation/error-hygiene tests
-    ├── review2.test.js     # retry-cap defaults, log format, README plan-requirement guard
-    ├── review3.test.js     # username contract, response classification, body-read timeout, retry budget
-    ├── review4.test.js     # username type validation, 200-shape validation, overall deadline, API key gate
-    ├── review5.test.js     # shared deadline across both stages, required-field guarantees, billing-cap wording
-    └── review6.test.js     # no attempt after the deadline, README error-classification / Retry-After / Spending-limit wording, lockfile engines
-```
-
-## Notes
-
-- Tweet data comes from the official X API v2 — no scraping is involved.
-- Response classification is status-first: any non-2xx answer from X is an
-  error carrying that status. A `200` is not trusted by status alone: the
-  X API can answer `200` with an `errors` array and no `data` (e.g. for a
-  suspended account), and this service also validates the success shape —
-  the body must be a JSON object, a user lookup must return a user object
-  with string `id`, `username` and `name`, a timeline's `data` (when
-  present) must be an array, and a tweet entry is only used when it
-  carries string `id`, `text` and `created_at` — so every field of the
-  documented success response is always present. The consequences differ
-  by level, though: a malformed user object, or a timeline whose `data`
-  is present but not an array, is an upstream error (`502 upstream_error`,
-  detail in the server log), never "user not found" or "no tweets"; a
-  malformed individual tweet entry is simply skipped, and if no valid
-  entry remains the answer is `404 no_tweets_found` even though the
-  upstream returned entries. A
-  `200` with both `data` and `errors` is a partial success and the `data`
-  is used. One honest limitation: a shape-valid but semantically empty
-  success response is indistinguishable from a genuinely empty timeline —
-  for timelines, a `200` with no `data` field at all is exactly the API's
-  empty-result shape and yields `404 no_tweets_found`.
-- Timeouts are not retried (only `429` is). The per-request timeout covers
-  reading the response body as well; a body that stalls past the timeout
-  is reported as a timeout, not as an empty result.
-- Server-side error logs go to stderr with an ISO 8601 timestamp and a
-  per-request ID (`requestId=...`), and each upstream 429 retry is logged
-  as a warning with its attempt number and wait time, so a failing request
-  can be followed in plain `console` output or any log pipeline.
-- If the target user posts rarely, the "latest" tweet may be old; that is the
-  API's data, not a caching artifact (the `cached` flag and `CACHE_TTL_SECONDS`
-  make the cache window explicit).
+| File | Covers |
+|---|---|
+| `test/twitterClient.test.js` | Client basics: URL/UA, normalisation, newest-by-timestamp selection |
+| `test/app.test.js` | HTTP behaviour with a stub client: payload shape, cache, overrides, error mapping |
+| `test/hardening.test.js` | Input hardening: non-string usernames, flag parsing, key gate, per-flag cache keys |
+| `test/embed.test.js` | The embedding surface: library exports, handler on a host router, sub-app mounting, client customisation (baseUrl / userAgent / wrapped fetch), per-instance caches |
+| `test/review2.test.js` | 429 retry semantics: Retry-After, reset header, 30 s fail-fast, budget |
+| `test/review3.test.js` | Parsing edges: missing/malformed `__NEXT_DATA__`, not-found signature, unusable entries |
+| `test/review4.test.js` | Retweet/reply filtering, incl. text-only RTs and self-replies |
+| `test/review5.test.js` | Deadline semantics: no attempt after the deadline, waits that would cross it refused |
+| `test/review6.test.js` | Documentation guards: README/.env.example/server.js/package.json consistency |
+| `test/helpers.js` | Feed fixtures in the observed payload shape (not a test file) |

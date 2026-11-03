@@ -1,106 +1,175 @@
 'use strict';
 
-const { test, before, after } = require('node:test');
+const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { createApp } = require('../src/app');
-const { TwitterClient } = require('../src/twitterClient');
+const { TwitterApiError } = require('../src/twitterClient');
 
-function jsonResponse(body, { status = 200 } = {}) {
+async function withServer(app, fn) {
+  const server = await new Promise((resolve) => {
+    const s = app.listen(0, () => resolve(s));
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    await fn(base);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+function stubClient(impl) {
+  const calls = [];
   return {
-    ok: status >= 200 && status < 300,
-    status,
-    statusText: status === 200 ? 'OK' : 'Error',
-    json: async () => body,
+    calls,
+    operationDeadlineAt: () => Date.now() + 60_000,
+    getLatestPost: async (username, opts) => {
+      calls.push({ username, opts });
+      return impl(username, opts);
+    },
   };
 }
 
-// Fully mocked X API: no real network calls to api.twitter.com.
-function mockFetch(url) {
-  if (url.includes('/users/by/username/elonmusk')) {
-    return jsonResponse({ data: { id: '44196397', name: 'Elon Musk', username: 'elonmusk' } });
-  }
-  if (url.includes('/users/by/username/ratelimited')) {
-    return jsonResponse({ title: 'Too Many Requests', detail: 'Rate limit' }, { status: 429 });
-  }
-  if (url.includes('/users/by/username/')) {
-    return jsonResponse({ errors: [{ message: 'Not Found Error' }] }, { status: 404 });
-  }
-  if (url.includes('/users/44196397/tweets')) {
-    return jsonResponse({
-      data: [
-        {
-          id: '1853000000000000000',
-          text: 'Mocked latest tweet text',
-          created_at: '2026-11-03T01:23:45.000Z',
-          author_id: '44196397',
-        },
-      ],
-      meta: { result_count: 1 },
-    });
-  }
-  throw new Error(`Unexpected URL in mock: ${url}`);
-}
+const okResult = {
+  user: { id: '11348282', username: 'nasa', name: 'NASA' },
+  tweet: { id: '2002', text: 'hello', created_at: '2026-11-02T12:00:00.000Z' },
+};
 
-let server;
-let baseUrl;
-
-before(async () => {
-  const client = new TwitterClient({ bearerToken: 'TEST_TOKEN', fetchImpl: mockFetch });
-  const app = createApp({ client, username: 'elonmusk', cacheTtlMs: 60_000 });
-  await new Promise((resolve) => {
-    server = app.listen(0, () => {
-      baseUrl = `http://127.0.0.1:${server.address().port}`;
-      resolve();
-    });
+test('GET /health answers ok', async () => {
+  const app = createApp({ client: stubClient(async () => okResult), username: 'nasa' });
+  await withServer(app, async (base) => {
+    const res = await fetch(`${base}/health`);
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { status: 'ok' });
   });
 });
 
-after(async () => {
-  await new Promise((resolve) => server.close(resolve));
+test('GET /latest-tweet returns the payload shape with a permalink and author', async () => {
+  const client = stubClient(async () => okResult);
+  const app = createApp({ client, username: 'nasa' });
+  await withServer(app, async (base) => {
+    const res = await fetch(`${base}/latest-tweet`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.deepEqual(body, {
+      id: '2002',
+      text: 'hello',
+      created_at: '2026-11-02T12:00:00.000Z',
+      url: 'https://twitter.com/nasa/status/2002',
+      author: { id: '11348282', username: 'nasa', name: 'NASA' },
+      cached: false,
+    });
+    assert.equal(client.calls[0].username, 'nasa');
+  });
 });
 
-test('GET /health returns ok', async () => {
-  const res = await fetch(`${baseUrl}/health`);
-  assert.equal(res.status, 200);
-  assert.deepEqual(await res.json(), { status: 'ok' });
+test('a second identical request is served from cache (client called once)', async () => {
+  const client = stubClient(async () => okResult);
+  const app = createApp({ client, username: 'nasa', cacheTtlMs: 60_000 });
+  await withServer(app, async (base) => {
+    await (await fetch(`${base}/latest-tweet`)).json();
+    const body = await (await fetch(`${base}/latest-tweet`)).json();
+    assert.equal(body.cached, true);
+    assert.equal(client.calls.length, 1);
+  });
 });
 
-test('GET /latest-tweet returns text, created_at and link as JSON', async () => {
-  const res = await fetch(`${baseUrl}/latest-tweet`);
-  assert.equal(res.status, 200);
-  const body = await res.json();
-  assert.equal(body.id, '1853000000000000000');
-  assert.equal(body.text, 'Mocked latest tweet text');
-  assert.equal(body.created_at, '2026-11-03T01:23:45.000Z');
-  assert.equal(body.url, 'https://twitter.com/elonmusk/status/1853000000000000000');
-  assert.deepEqual(body.author, { id: '44196397', username: 'elonmusk', name: 'Elon Musk' });
-  assert.equal(body.cached, false);
+test('?username= overrides the default and a leading @ is stripped', async () => {
+  const client = stubClient(async () => okResult);
+  const app = createApp({ client, username: 'nasa' });
+  await withServer(app, async (base) => {
+    const res = await fetch(`${base}/latest-tweet?username=@spacex`);
+    assert.equal(res.status, 200);
+    assert.equal(client.calls[0].username, 'spacex');
+  });
 });
 
-test('second identical request is served from cache', async () => {
-  const res = await fetch(`${baseUrl}/latest-tweet`);
-  const body = await res.json();
-  assert.equal(res.status, 200);
-  assert.equal(body.cached, true);
+test('exclude flags from the query string reach the client', async () => {
+  const client = stubClient(async () => okResult);
+  const app = createApp({ client, username: 'nasa' });
+  await withServer(app, async (base) => {
+    await fetch(`${base}/latest-tweet?exclude_retweets=include&exclude_replies=include`);
+    assert.equal(client.calls[0].opts.excludeRetweets, false);
+    assert.equal(client.calls[0].opts.excludeReplies, false);
+  });
 });
 
-test('unknown user returns 404 with a clear error body', async () => {
-  const res = await fetch(`${baseUrl}/latest-tweet?username=doesnotexist123`);
-  assert.equal(res.status, 404);
-  const body = await res.json();
-  assert.equal(body.error, 'user_not_found');
+test('invalid username -> 400 invalid_username, client untouched', async () => {
+  const client = stubClient(async () => okResult);
+  const app = createApp({ client, username: 'nasa' });
+  await withServer(app, async (base) => {
+    const res = await fetch(`${base}/latest-tweet?username=${encodeURIComponent('bad name!')}`);
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).error, 'invalid_username');
+    assert.equal(client.calls.length, 0);
+  });
 });
 
-test('upstream rate limit is mapped to 503 rate_limited', async () => {
-  const res = await fetch(`${baseUrl}/latest-tweet?username=ratelimited`);
-  assert.equal(res.status, 503);
-  const body = await res.json();
-  assert.equal(body.error, 'rate_limited');
+test('user exists but nothing matches the filters -> 404 no_tweets_found', async () => {
+  const client = stubClient(async () => ({ user: okResult.user, tweet: null }));
+  const app = createApp({ client, username: 'nasa' });
+  await withServer(app, async (base) => {
+    const res = await fetch(`${base}/latest-tweet`);
+    assert.equal(res.status, 404);
+    assert.equal((await res.json()).error, 'no_tweets_found');
+  });
 });
 
-test('unknown route returns 404 JSON', async () => {
-  const res = await fetch(`${baseUrl}/nope`);
-  assert.equal(res.status, 404);
-  const body = await res.json();
-  assert.equal(body.error, 'not_found');
+test('client 404 -> 404 user_not_found', async () => {
+  const client = stubClient(async () => {
+    throw new TwitterApiError('nope', { status: 404, code: 'user_not_found' });
+  });
+  const app = createApp({ client, username: 'nasa' });
+  await withServer(app, async (base) => {
+    const res = await fetch(`${base}/latest-tweet?username=ghostuser`);
+    assert.equal(res.status, 404);
+    assert.equal((await res.json()).error, 'user_not_found');
+  });
+});
+
+test('client 429 -> 503 rate_limited with a Retry-After header', async () => {
+  const client = stubClient(async () => {
+    throw new TwitterApiError('rl', { status: 429, retryAfterMs: 7000, code: 'rate_limited' });
+  });
+  const app = createApp({ client, username: 'nasa' });
+  await withServer(app, async (base) => {
+    const res = await fetch(`${base}/latest-tweet`);
+    assert.equal(res.status, 503);
+    assert.equal((await res.json()).error, 'rate_limited');
+    assert.equal(res.headers.get('retry-after'), '7');
+  });
+});
+
+test('other upstream failures -> 502 upstream_error without internals leaking', async () => {
+  const client = stubClient(async () => {
+    throw new TwitterApiError('secret upstream detail', { status: 502, code: 'upstream_malformed' });
+  });
+  const app = createApp({ client, username: 'nasa' });
+  await withServer(app, async (base) => {
+    const res = await fetch(`${base}/latest-tweet`);
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.equal(body.error, 'upstream_error');
+    assert.doesNotMatch(JSON.stringify(body), /secret upstream detail/);
+  });
+});
+
+test('an unexpected client error -> 500 internal_error', async () => {
+  const client = stubClient(async () => {
+    throw new Error('boom');
+  });
+  const app = createApp({ client, username: 'nasa' });
+  await withServer(app, async (base) => {
+    const res = await fetch(`${base}/latest-tweet`);
+    assert.equal(res.status, 500);
+    assert.equal((await res.json()).error, 'internal_error');
+  });
+});
+
+test('unknown route -> 404 not_found', async () => {
+  const app = createApp({ client: stubClient(async () => okResult), username: 'nasa' });
+  await withServer(app, async (base) => {
+    const res = await fetch(`${base}/nope`);
+    assert.equal(res.status, 404);
+    assert.equal((await res.json()).error, 'not_found');
+  });
 });

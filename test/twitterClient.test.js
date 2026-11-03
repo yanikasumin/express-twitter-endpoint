@@ -2,79 +2,84 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { TwitterClient, TwitterApiError } = require('../src/twitterClient');
+const { TwitterClient, TwitterApiError, normalizeUsername } = require('../src/twitterClient');
+const { legacyTweet, pageProps, feedHtml, htmlResponse, queuedFetch, recordingSleep } = require('./helpers');
 
-function jsonResponse(body, { status = 200 } = {}) {
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    statusText: status === 200 ? 'OK' : 'Error',
-    json: async () => body,
-  };
-}
-
-test('constructor requires a bearer token', () => {
-  assert.throws(() => new TwitterClient({}), /TWITTER_BEARER_TOKEN/);
+test('constructor needs no token: a client can be built with defaults only', () => {
+  const client = new TwitterClient({ fetchImpl: async () => htmlResponse('') });
+  assert.equal(client.baseUrl, 'https://syndication.twitter.com');
+  assert.equal(client.timeoutMs, 10_000);
+  assert.equal(client.deadlineMs, 60_000);
 });
 
-test('getUserByUsername resolves username -> id and sends the Bearer header', async () => {
+test('constructor rejects out-of-range numeric options', () => {
+  const fetchImpl = async () => htmlResponse('');
+  assert.throws(() => new TwitterClient({ fetchImpl, timeoutMs: 0 }), /"timeoutMs"/);
+  assert.throws(() => new TwitterClient({ fetchImpl, timeoutMs: NaN }), /"timeoutMs"/);
+  assert.throws(() => new TwitterClient({ fetchImpl, maxRetries: -1 }), /"maxRetries"/);
+  assert.throws(() => new TwitterClient({ fetchImpl, maxRetries: 1.5 }), /"maxRetries"/);
+  assert.throws(() => new TwitterClient({ fetchImpl, retryBudgetMs: -5 }), /"retryBudgetMs"/);
+  assert.throws(() => new TwitterClient({ fetchImpl, deadlineMs: Infinity }), /"deadlineMs"/);
+});
+
+test('normalizeUsername strips one leading @ and validates the shape', () => {
+  assert.equal(normalizeUsername('@nasa'), 'nasa');
+  assert.equal(normalizeUsername('nasa'), 'nasa');
+  assert.equal(normalizeUsername('bad name'), null);
+  assert.equal(normalizeUsername(''), null);
+  assert.equal(normalizeUsername(42), null);
+  assert.equal(normalizeUsername('a'.repeat(16)), null);
+});
+
+test('getLatestPost requests the syndication profile URL with a browser UA', async () => {
   const seen = [];
-  const fetchImpl = async (url, opts) => {
-    seen.push({ url, opts });
-    return jsonResponse({ data: { id: '44196397', name: 'Elon Musk', username: 'elonmusk' } });
-  };
-  const client = new TwitterClient({ bearerToken: 'TEST_TOKEN', fetchImpl });
-
-  const user = await client.getUserByUsername('elonmusk');
-  assert.equal(user.id, '44196397');
-  assert.equal(user.username, 'elonmusk');
-  assert.match(seen[0].url, /\/users\/by\/username\/elonmusk/);
-  assert.equal(seen[0].opts.headers.Authorization, 'Bearer TEST_TOKEN');
-});
-
-test('getUserByUsername caches the resolved user', async () => {
-  let calls = 0;
-  const fetchImpl = async () => {
-    calls += 1;
-    return jsonResponse({ data: { id: '1', name: 'A', username: 'a' } });
-  };
-  const client = new TwitterClient({ bearerToken: 'T', fetchImpl });
-  await client.getUserByUsername('a');
-  await client.getUserByUsername('A');
-  assert.equal(calls, 1);
-});
-
-test('getLatestTweet requests max_results and exclude params', async () => {
-  let requestedUrl = null;
-  const fetchImpl = async (url) => {
-    requestedUrl = url;
-    return jsonResponse({
-      data: [{ id: '123', text: 'hello', created_at: '2026-11-03T00:00:00.000Z', author_id: '44196397' }],
-      meta: { result_count: 1 },
-    });
-  };
-  const client = new TwitterClient({ bearerToken: 'T', fetchImpl });
-  const tweet = await client.getLatestTweet('44196397', { excludeRetweets: true, excludeReplies: false });
-
-  assert.equal(tweet.id, '123');
-  const u = new URL(requestedUrl);
-  assert.equal(u.searchParams.get('exclude'), 'retweets');
-  assert.equal(u.searchParams.get('max_results'), '5');
-});
-
-test('getLatestTweet returns null when there are no tweets', async () => {
-  const fetchImpl = async () => jsonResponse({ meta: { result_count: 0 } });
-  const client = new TwitterClient({ bearerToken: 'T', fetchImpl });
-  const tweet = await client.getLatestTweet('999', {});
-  assert.equal(tweet, null);
-});
-
-test('API errors are surfaced as TwitterApiError with status', async () => {
-  const fetchImpl = async () =>
-    jsonResponse({ title: 'Too Many Requests', detail: 'Rate limit exceeded' }, { status: 429 });
-  const client = new TwitterClient({ bearerToken: 'T', fetchImpl });
-  await assert.rejects(
-    () => client.getUserByUsername('elonmusk'),
-    (err) => err instanceof TwitterApiError && err.status === 429
+  const html = feedHtml(pageProps({ tweets: [legacyTweet({})] }));
+  const client = new TwitterClient({ fetchImpl: queuedFetch([htmlResponse(html)], seen) });
+  await client.getLatestPost('nasa');
+  assert.equal(seen.length, 1);
+  assert.equal(
+    seen[0].url,
+    'https://syndication.twitter.com/srv/timeline-profile/screen-name/nasa'
   );
+  assert.match(seen[0].opts.headers['User-Agent'], /Mozilla\/5\.0/);
+  assert.equal(seen[0].opts.method, 'GET');
+});
+
+test('getLatestPost returns the newest post and the author, with ISO created_at', async () => {
+  const tweets = [
+    legacyTweet({ id: '2002', text: 'newer', createdAt: 'Mon Nov 02 12:00:00 +0000 2026' }),
+    legacyTweet({ id: '2001', text: 'older', createdAt: 'Mon Nov 02 09:00:00 +0000 2026' }),
+  ];
+  const client = new TwitterClient({
+    fetchImpl: queuedFetch([htmlResponse(feedHtml(pageProps({ tweets })))]),
+  });
+  const { user, tweet } = await client.getLatestPost('nasa');
+  assert.equal(tweet.id, '2002');
+  assert.equal(tweet.text, 'newer');
+  assert.equal(tweet.created_at, '2026-11-02T12:00:00.000Z');
+  assert.deepEqual(user, { id: '11348282', username: 'nasa', name: 'NASA' });
+});
+
+test('selection is by timestamp, not feed order (a pinned older post must not win)', async () => {
+  const tweets = [
+    legacyTweet({ id: '3001', text: 'pinned old', createdAt: 'Wed Jan 01 10:00:00 +0000 2025' }),
+    legacyTweet({ id: '3002', text: 'latest', createdAt: 'Mon Nov 02 08:00:00 +0000 2026' }),
+  ];
+  const client = new TwitterClient({
+    fetchImpl: queuedFetch([htmlResponse(feedHtml(pageProps({ tweets })))]),
+  });
+  const { tweet } = await client.getLatestPost('nasa');
+  assert.equal(tweet.id, '3002');
+});
+
+test('invalid username is rejected before any upstream call', async () => {
+  const seen = [];
+  const client = new TwitterClient({ fetchImpl: queuedFetch([], seen) });
+  await assert.rejects(client.getLatestPost('not a user!'), (err) => {
+    assert.ok(err instanceof TwitterApiError);
+    assert.equal(err.status, 400);
+    assert.equal(err.code, 'invalid_username');
+    return true;
+  });
+  assert.equal(seen.length, 0);
 });

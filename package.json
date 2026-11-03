@@ -1,1 +1,18 @@
-{"dependencies":{"express":"^4.19.2"},"description":"Single Express.js endpoint that returns the latest tweet of a given X (Twitter) user as JSON, via the X API v2.","engines":{"node":">=20.6.0"},"main":"src/server.js","name":"express-twitter-endpoint","scripts":{"dev":"node --env-file=.env --watch src/server.js","start":"node --env-file=.env src/server.js","test":"node --test test/*.test.js"},"type":"commonjs","version":"1.0.0"}
+{
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "description": "Single Express.js endpoint that returns the latest tweet of a given X (Twitter) user as JSON, via the public syndication feed - no X API key required.",
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "main": "src/index.js",
+  "name": "express-twitter-endpoint",
+  "scripts": {
+    "dev": "node --env-file=.env --watch src/server.js",
+    "start": "node --env-file=.env src/server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "type": "commonjs",
+  "version": "1.0.0"
+}
